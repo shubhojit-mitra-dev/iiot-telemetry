@@ -1,6 +1,8 @@
 package api
 
 import (
+	"bufio"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -75,5 +77,57 @@ func TestRecoveryMiddleware(t *testing.T) {
 
 	if rr.Code != http.StatusInternalServerError {
 		t.Fatalf("expected 500 Internal Server Error, got %d", rr.Code)
+	}
+}
+
+type mockHijackFlusher struct {
+	http.ResponseWriter
+	hijacked bool
+	flushed  bool
+}
+
+func (m *mockHijackFlusher) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	m.hijacked = true
+	c1, _ := net.Pipe()
+	return c1, bufio.NewReadWriter(bufio.NewReader(c1), bufio.NewWriter(c1)), nil
+}
+
+func (m *mockHijackFlusher) Flush() {
+	m.flushed = true
+}
+
+func TestResponseWriter_HijackerAndFlusher(t *testing.T) {
+	// Case 1: Underlying ResponseWriter does NOT implement Hijacker
+	baseRec := httptest.NewRecorder()
+	rw := &responseWriter{ResponseWriter: baseRec, statusCode: http.StatusOK}
+
+	_, _, err := rw.Hijack()
+	if err == nil {
+		t.Fatal("expected error when underlying writer does not implement http.Hijacker")
+	}
+
+	// Unwrap check
+	if rw.Unwrap() != baseRec {
+		t.Fatal("expected Unwrap to return underlying recorder")
+	}
+
+	// Case 2: Underlying ResponseWriter implements Hijacker and Flusher
+	mock := &mockHijackFlusher{ResponseWriter: baseRec}
+	rwWithMock := &responseWriter{ResponseWriter: mock, statusCode: http.StatusOK}
+
+	conn, bufrw, err := rwWithMock.Hijack()
+	if err != nil {
+		t.Fatalf("unexpected hijack error: %v", err)
+	}
+	if conn != nil {
+		defer conn.Close()
+	}
+	if bufrw == nil || !mock.hijacked {
+		t.Fatal("expected successful hijack on mock")
+	}
+
+	rwWithMock.Flush()
+	if !mock.flushed {
+		t.Fatal("expected Flush to be called on mock")
 	}
 }
