@@ -21,7 +21,7 @@ import (
 func main() {
 	// 1. Initialize High-Performance Structured JSON Logger
 	logLevel := slog.LevelInfo
-	if os.Getenv("BENCH_MODE") == "1" || os.Getenv("LOG_LEVEL") == "WARN" {
+	if os.Getenv("LOG_LEVEL") == "WARN" {
 		logLevel = slog.LevelWarn
 	}
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
@@ -34,6 +34,7 @@ func main() {
 		"os", runtime.GOOS,
 		"arch", runtime.GOARCH,
 		"num_cpu", runtime.NumCPU(),
+		"bench_mode", os.Getenv("BENCH_MODE") == "1",
 	)
 
 	// 2. Setup Context with Signal Notification for Graceful Shutdown
@@ -108,7 +109,11 @@ func main() {
 	// 8. Launch Server Asynchronously
 	serverErr := make(chan error, 1)
 	go func() {
-		slog.Info("telemetry ingestion server listening", "addr", server.Addr)
+		slog.Info("telemetry server listening",
+			"addr", server.Addr,
+			"http_endpoint", fmt.Sprintf("http://localhost:%s/api/v1/telemetry", port),
+			"ws_endpoint", fmt.Sprintf("ws://localhost:%s/ws/telemetry", port),
+		)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serverErr <- err
 		}
