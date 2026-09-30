@@ -22,9 +22,11 @@ func NewRedisRepository(ctx context.Context, addr string, password string, db in
 		DB:           db,
 		PoolSize:     100, // Handle high concurrency worker connections
 		MinIdleConns: 10,
+		MaxRetries:   1, // Minimize retry noise when testing connectivity
 	})
 
 	if err := rdb.Ping(ctx).Err(); err != nil {
+		_ = rdb.Close()
 		return nil, fmt.Errorf("failed to ping redis at %s: %w", addr, err)
 	}
 
