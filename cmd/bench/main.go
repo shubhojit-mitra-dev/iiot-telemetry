@@ -90,21 +90,40 @@ func main() {
 
 	startTime := time.Now()
 
-	// Rate limiter channel: provides tokens to control dispatch rate
+	// Rate limiter channel: provides tokens to control dispatch rate.
+	// Uses a 100Hz batched bucket to ensure high rates (5k-50k) are not artificially
+	// throttled by the Windows kernel timer resolution (~1ms/64Hz).
 	var tokenCh chan struct{}
 	if *targetRate > 0 {
 		tokenCh = make(chan struct{}, *targetRate*2)
 		go func() {
-			ticker := time.NewTicker(time.Second / time.Duration(*targetRate))
+			tickFrequency := 100
+			batchSize := *targetRate / tickFrequency
+			if batchSize < 1 {
+				batchSize = 1
+			}
+			interval := time.Second / time.Duration(tickFrequency)
+			ticker := time.NewTicker(interval)
 			defer ticker.Stop()
+
+			// Pre-fill initial batch
+			for i := 0; i < batchSize; i++ {
+				select {
+				case tokenCh <- struct{}{}:
+				default:
+				}
+			}
+
 			for {
 				select {
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
-					select {
-					case tokenCh <- struct{}{}:
-					default:
+					for i := 0; i < batchSize; i++ {
+						select {
+						case tokenCh <- struct{}{}:
+						default:
+						}
 					}
 				}
 			}
