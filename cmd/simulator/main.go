@@ -48,16 +48,17 @@ func DefaultDeviceConfigs() []DeviceConfig {
 
 // MachineActor maintains the persistent physical telemetry state of a single machine.
 type MachineActor struct {
-	mu                     sync.Mutex
-	Config                 DeviceConfig
-	CurrentTemp            float64
-	CurrentVib             float64
-	CurrentRPM             int64
-	InAnomaly              bool
-	AnomalyTicksRemaining  int
-	TargetAnomalyTemp      float64
-	TargetAnomalyVib       float64
-	rng                    *rand.Rand
+	mu                    sync.Mutex
+	Config                DeviceConfig
+	CurrentTemp           float64
+	CurrentVib            float64
+	CurrentRPM            int64
+	InAnomaly             bool
+	AnomalyTicksRemaining int
+	TargetAnomalyTemp     float64
+	TargetAnomalyVib      float64
+	Cycle                 float64
+	rng                   *rand.Rand
 }
 
 // NewMachineActor constructs a stateful actor initialized with baseline metrics.
@@ -70,6 +71,7 @@ func NewMachineActor(cfg DeviceConfig, rng *rand.Rand) *MachineActor {
 		CurrentTemp: cfg.BaseTemp,
 		CurrentVib:  cfg.BaseVib,
 		CurrentRPM:  cfg.BaseRPM,
+		Cycle:       float64(rng.Intn(100)),
 		rng:         rng,
 	}
 }
@@ -85,41 +87,89 @@ func (a *MachineActor) InjectAnomaly(ticks int, temp float64, vib float64) {
 	a.TargetAnomalyVib = vib
 }
 
-// Tick calculates the next telemetry state incorporating Gaussian noise, mean reversion, and anomalies.
+// Tick calculates the next telemetry state incorporating dynamic operational waves, Gaussian noise, and anomalies.
 func (a *MachineActor) Tick(now time.Time, anomalyRate float64) model.TelemetryPayload {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
+	a.Cycle += 0.08
+
 	// Check for probabilistic anomaly trigger if not already undergoing an incident
 	if !a.InAnomaly && anomalyRate > 0 && a.rng.Float64() < anomalyRate {
 		a.InAnomaly = true
-		a.AnomalyTicksRemaining = 3 + a.rng.Intn(3) // 3-5 consecutive ticks of anomaly
-		a.TargetAnomalyTemp = 122.0 + a.rng.Float64()*18.0 // 122°C - 140°C
-		a.TargetAnomalyVib = a.Config.BaseVib + 6.0 + a.rng.Float64()*4.0 // 10 - 15 mm/s
+		a.AnomalyTicksRemaining = 4 + a.rng.Intn(4) // 4-7 consecutive ticks
+		// 50% probability of high-temp bearing friction, 50% compound vibration spike
+		if a.rng.Float64() < 0.5 {
+			a.TargetAnomalyTemp = 124.0 + a.rng.Float64()*16.0 // 124°C - 140°C
+			a.TargetAnomalyVib = a.Config.BaseVib + 7.0 + a.rng.Float64()*5.0
+		} else {
+			a.TargetAnomalyTemp = 121.0 + a.rng.Float64()*12.0
+			a.TargetAnomalyVib = 13.0 + a.rng.Float64()*4.0 // 13 - 17 mm/s
+		}
 	}
 
 	if a.InAnomaly {
-		// Elevate metrics directly into critical anomaly zone
-		a.CurrentTemp = a.TargetAnomalyTemp + (a.rng.NormFloat64() * 0.5)
-		a.CurrentVib = a.TargetAnomalyVib + (a.rng.NormFloat64() * 0.3)
-		a.CurrentRPM = a.Config.BaseRPM + int64(a.rng.NormFloat64()*120.0)
+		// Drive metrics directly into critical anomaly zone
+		a.CurrentTemp = a.TargetAnomalyTemp + (a.rng.NormFloat64() * 0.8)
+		a.CurrentVib = a.TargetAnomalyVib + (a.rng.NormFloat64() * 0.5)
+		a.CurrentRPM = a.Config.BaseRPM + int64(a.rng.NormFloat64()*180.0)
 
 		a.AnomalyTicksRemaining--
 		if a.AnomalyTicksRemaining <= 0 {
 			a.InAnomaly = false
 		}
 	} else {
-		// Normal physics: Mean-reverting Ornstein-Uhlenbeck-style drift towards base metrics
-		tempMeanReversion := (a.Config.BaseTemp - a.CurrentTemp) * 0.10
-		tempNoise := a.rng.NormFloat64() * 0.4
+		// Realistic operational dynamics based on machine mechanical profile
+		var loadTempOffset, loadVibOffset float64
+		var loadRpmOffset int64
+
+		switch a.Config.Type {
+		case "Turbine":
+			// Gas turbine thermal inertia with aerodynamic pressure variations
+			loadTempOffset = math.Sin(a.Cycle*0.5) * 3.5
+			loadVibOffset = math.Sin(a.Cycle*1.2) * 0.45
+			loadRpmOffset = int64(math.Cos(a.Cycle*0.5) * 40)
+		case "Welder":
+			// Robotic welder duty cycles: periodic high heat cycle
+			duty := math.Sin(a.Cycle * 0.7)
+			if duty > 0.3 {
+				loadTempOffset = (duty - 0.3) * 14.0
+				loadVibOffset = (duty - 0.3) * 1.6
+			}
+		case "CNC":
+			// Tooling engagement cuts cause dynamic vibration and torque variation
+			toolCut := math.Sin(a.Cycle * 1.4)
+			if toolCut > 0.3 {
+				loadVibOffset = (toolCut - 0.3) * 2.0
+				loadRpmOffset = -int64((toolCut - 0.3) * 90)
+				loadTempOffset = (toolCut - 0.3) * 3.0
+			}
+		case "Compressor":
+			loadTempOffset = math.Sin(a.Cycle*0.6) * 3.0
+			loadVibOffset = math.Cos(a.Cycle*1.5) * 0.65
+			loadRpmOffset = int64(math.Sin(a.Cycle*0.6) * 35)
+		case "Pump":
+			loadTempOffset = math.Sin(a.Cycle*0.4) * 2.4
+			loadVibOffset = math.Sin(a.Cycle*1.8) * 0.55
+			loadRpmOffset = int64(math.Cos(a.Cycle*0.4) * 25)
+		default:
+			loadTempOffset = math.Sin(a.Cycle*0.5) * 2.5
+			loadVibOffset = math.Sin(a.Cycle*1.0) * 0.4
+		}
+
+		targetTemp := a.Config.BaseTemp + loadTempOffset
+		tempMeanReversion := (targetTemp - a.CurrentTemp) * 0.12
+		tempNoise := a.rng.NormFloat64() * 0.7
 		a.CurrentTemp += tempMeanReversion + tempNoise
 
-		vibMeanReversion := (a.Config.BaseVib - a.CurrentVib) * 0.12
-		vibNoise := a.rng.NormFloat64() * 0.15
+		targetVib := a.Config.BaseVib + loadVibOffset
+		vibMeanReversion := (targetVib - a.CurrentVib) * 0.15
+		vibNoise := a.rng.NormFloat64() * 0.25
 		a.CurrentVib += vibMeanReversion + vibNoise
 
-		rpmMeanReversion := float64(a.Config.BaseRPM-a.CurrentRPM) * 0.15
-		rpmNoise := a.rng.NormFloat64() * 15.0
+		targetRpm := a.Config.BaseRPM + loadRpmOffset
+		rpmMeanReversion := float64(targetRpm-a.CurrentRPM) * 0.2
+		rpmNoise := a.rng.NormFloat64() * 20.0
 		a.CurrentRPM += int64(rpmMeanReversion + rpmNoise)
 	}
 
@@ -153,7 +203,7 @@ type Simulator struct {
 // NewSimulator constructs an initialized simulator instance.
 func NewSimulator(cfg SimulatorConfig) *Simulator {
 	if cfg.Interval <= 0 {
-		cfg.Interval = 1 * time.Second
+		cfg.Interval = 500 * time.Millisecond
 	}
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = &http.Client{
@@ -171,7 +221,6 @@ func NewSimulator(cfg SimulatorConfig) *Simulator {
 
 	actors := make([]*MachineActor, len(cfg.Devices))
 	for i, d := range cfg.Devices {
-		// Use unique seeds per machine actor for independent deterministic entropy
 		actors[i] = NewMachineActor(d, rand.New(rand.NewSource(time.Now().UnixNano()+int64(i*1000))))
 	}
 
@@ -257,15 +306,23 @@ func main() {
 	slog.SetDefault(logger)
 
 	targetURL := flag.String("url", "http://localhost:8080/api/v1/telemetry", "Target HTTP Ingestion URL")
-	interval := flag.Duration("interval", 1*time.Second, "Telemetry generation interval per machine")
-	anomalyRate := flag.Float64("anomaly-rate", 0.02, "Probability of anomaly occurrence per tick (0.0 - 1.0)")
+	interval := flag.Duration("interval", 500*time.Millisecond, "Telemetry generation interval per machine")
+	anomalyPercent := flag.Int("anomaly-percent", 3, "Probability percentage of anomaly occurrence (e.g. 3 for 3%)")
+	anomalyRateFlag := flag.Float64("anomaly-rate", 0.03, "Probability of anomaly occurrence per tick (0.0 - 1.0)")
 	duration := flag.Duration("duration", 0, "Execution duration (0 for indefinite until signal)")
 	flag.Parse()
+
+	// Prevent PowerShell decimal parsing issues by prioritizing percentage flag
+	effectiveAnomalyRate := *anomalyRateFlag
+	if *anomalyPercent > 0 {
+		effectiveAnomalyRate = float64(*anomalyPercent) / 100.0
+	}
 
 	slog.Info("starting iiot machinery edge simulator",
 		"target_url", *targetURL,
 		"interval", *interval,
-		"anomaly_rate", *anomalyRate,
+		"anomaly_rate", effectiveAnomalyRate,
+		"anomaly_percent", fmt.Sprintf("%.1f%%", effectiveAnomalyRate*100),
 		"device_count", len(DefaultDeviceConfigs()),
 	)
 
@@ -281,7 +338,7 @@ func main() {
 	sim := NewSimulator(SimulatorConfig{
 		TargetURL:   *targetURL,
 		Interval:    *interval,
-		AnomalyRate: *anomalyRate,
+		AnomalyRate: effectiveAnomalyRate,
 	})
 
 	sim.Start(ctx)

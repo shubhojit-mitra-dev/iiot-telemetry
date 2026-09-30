@@ -46,7 +46,6 @@ func TestMachineActor_PhysicsAndMeanReversion(t *testing.T) {
 		BaseRPM:  3000,
 	}
 
-	// Seed RNG for deterministic test execution (FIRST - Repeatable)
 	rng := rand.New(rand.NewSource(42))
 	actor := NewMachineActor(cfg, rng)
 
@@ -54,8 +53,8 @@ func TestMachineActor_PhysicsAndMeanReversion(t *testing.T) {
 	actor.CurrentTemp = 150.0
 
 	now := time.Now()
-	for i := 0; i < 30; i++ {
-		p := actor.Tick(now.Add(time.Duration(i) * time.Second), 0.0) // 0% anomaly rate
+	for i := 0; i < 40; i++ {
+		p := actor.Tick(now.Add(time.Duration(i)*time.Second), 0.0)
 		if p.DeviceID != "TEST-001" {
 			t.Errorf("expected DeviceID TEST-001, got %s", p.DeviceID)
 		}
@@ -64,9 +63,37 @@ func TestMachineActor_PhysicsAndMeanReversion(t *testing.T) {
 		}
 	}
 
-	// After 30 ticks without anomaly, mean reversion should pull temperature closer to BaseTemp (80.0)
-	if actor.CurrentTemp >= 110.0 {
+	// Mean reversion should pull temperature back near operational bounds (80 ± 5)
+	if actor.CurrentTemp >= 105.0 {
 		t.Errorf("expected temperature to mean-revert toward 80, but remains high: %f", actor.CurrentTemp)
+	}
+}
+
+func TestMachineActor_MachineTypeDynamics(t *testing.T) {
+	// Test Welder thermal pulse dynamics
+	welderCfg := DeviceConfig{
+		ID:       "WELD-001",
+		Name:     "Robotic Welder",
+		Type:     "Welder",
+		BaseTemp: 95.0,
+		BaseVib:  8.2,
+		BaseRPM:  2400,
+	}
+	welder := NewMachineActor(welderCfg, rand.New(rand.NewSource(1)))
+	welder.Cycle = 0.0
+
+	var maxTemp float64
+	now := time.Now()
+	for i := 0; i < 50; i++ {
+		p := welder.Tick(now.Add(time.Duration(i)*time.Second), 0.0)
+		if p.Temperature > maxTemp {
+			maxTemp = p.Temperature
+		}
+	}
+
+	// Welder duty cycle should push temperature above base (95°C) during arc passes
+	if maxTemp <= welderCfg.BaseTemp {
+		t.Errorf("expected welder duty cycle to generate thermal pulses above base, max was: %f", maxTemp)
 	}
 }
 
@@ -83,12 +110,10 @@ func TestMachineActor_AnomalyInjection(t *testing.T) {
 	rng := rand.New(rand.NewSource(100))
 	actor := NewMachineActor(cfg, rng)
 
-	// Programmatically inject an anomaly of 3 ticks duration
 	actor.InjectAnomaly(3, 130.0, 14.5)
 
 	now := time.Now()
 
-	// Tick 1: Should be in anomaly state
 	p1 := actor.Tick(now, 0.0)
 	if p1.Temperature < 120.0 {
 		t.Errorf("expected anomaly temp > 120, got %f", p1.Temperature)
@@ -97,21 +122,19 @@ func TestMachineActor_AnomalyInjection(t *testing.T) {
 		t.Errorf("expected anomaly vibration > 12, got %f", p1.Vibration)
 	}
 
-	// Tick 2: Still in anomaly state
 	p2 := actor.Tick(now.Add(time.Second), 0.0)
 	if p2.Temperature < 120.0 {
 		t.Errorf("expected tick 2 temp > 120, got %f", p2.Temperature)
 	}
 
-	// Tick 3: Last tick of anomaly
 	p3 := actor.Tick(now.Add(2*time.Second), 0.0)
 	if p3.Temperature < 120.0 {
 		t.Errorf("expected tick 3 temp > 120, got %f", p3.Temperature)
 	}
 
-	// Tick 4: Anomaly should have expired; returning toward normal range
+	// Tick 4: Anomaly expired
 	p4 := actor.Tick(now.Add(3*time.Second), 0.0)
-	if p4.Temperature > 125.0 {
+	if p4.Temperature > 128.0 {
 		t.Errorf("expected temperature to drop after anomaly expired, got %f", p4.Temperature)
 	}
 }
@@ -131,8 +154,8 @@ func TestMachineActor_ProbabilisticAnomaly(t *testing.T) {
 
 	// Anomaly rate 1.0 (100% chance)
 	p := actor.Tick(time.Now(), 1.0)
-	if p.Temperature < 120.0 {
-		t.Errorf("expected 100%% anomaly rate to trigger temp > 120, got %f", p.Temperature)
+	if p.Temperature < 120.0 && p.Vibration < 12.0 {
+		t.Errorf("expected 100%% anomaly rate to trigger threshold breach, got temp=%f, vib=%f", p.Temperature, p.Vibration)
 	}
 }
 
@@ -263,10 +286,8 @@ func TestSimulator_Lifecycle(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	sim.Start(ctx)
 
-	// Allow simulator to run for a few ticks
 	time.Sleep(100 * time.Millisecond)
 
-	// Stop simulator
 	cancel()
 	sim.Wait()
 
