@@ -1,91 +1,72 @@
 # Phase 1: High-Performance Vanilla Go Ingestion Backend
 
-**Target Audience:** Senior/Staff Implementing Agents
+**Target Audience:** Senior/Staff Implementing Agents  
 **Objective:** Build an ultra-low latency, highly optimized Go HTTP ingestion server using *only* the Go Standard Library for routing. No Fiber, no Gin, no web frameworks.
 
 ## 1. Architectural Philosophy & Constraints
-- **Zero Web Frameworks:** Use standard `net/http`. 
-- **Memory Optimization:** Pre-allocate all slices. Use `sync.Pool` for struct allocation to prevent garbage collection (GC) thrashing during high-frequency ingestion spikes.
-- **Asynchronous Processing:** The HTTP handler must *never* block for database I/O. Incoming requests are validated and immediately passed into a buffered Go channel. The HTTP handler immediately returns `202 Accepted`. A background Worker Pool consumes the channel to write to Redis.
-- **Graceful Shutdown:** The server must intercept `SIGINT`/`SIGTERM`, stop accepting new requests, flush all channels, close Redis connections, and close WebSocket hubs cleanly.
+- **Zero Web Frameworks:** Use standard `net/http.ServeMux`.
+- **Memory Optimization:** Pre-allocate slices where possible. Use `sync.Pool` for struct allocation to eliminate garbage collection (GC) thrashing during high-frequency ingestion spikes (10,000+ msgs/sec).
+- **Asynchronous Processing:** The HTTP handler must *never* block for database I/O. Incoming requests are validated and immediately passed into a buffered Go channel (`make(chan TelemetryPayload, 10000)`). The HTTP handler immediately returns `202 Accepted`. A background Worker Pool consumes the channel to persist state and broadcast.
+- **Graceful Shutdown:** The server must intercept `SIGINT`/`SIGTERM`, stop accepting new requests, flush all worker queues with a 10s deadline, close Redis connection pools, and terminate WebSocket client connections cleanly.
+- **Resilient Fallback:** The repository uses an interface pattern with dual implementations: production Redis cluster pool and a concurrent in-memory store for standalone/testing environments.
 
-## 2. Directory Structure (Domain-Driven Design)
+## 2. Directory Structure (Flat / Fider-Inspired Domain Architecture)
 ```text
-backend/
-├── cmd/
-│   └── server/
-│       └── main.go         # Bootstrapper, Dependency Injection, Signal handling
-├── internal/
+├── main.go                     # Bootstrapper, Dependency Injection, Signal handling
+├── app/
 │   ├── api/
-│   │   ├── http.go         # net/http ServeMux and middleware (CORS, Logging, Recover)
-│   │   ├── ingest.go       # POST /api/v1/telemetry handler
-│   │   └── ws.go           # GET /ws/telemetry handler
-│   ├── models/
-│   │   └── telemetry.go    # Data structures with struct tags and sync.Pool definitions
+│   │   ├── handler.go          # Handlers for Ingest, Health, Devices, WebSockets
+│   │   ├── middleware.go       # CORS, Structured Slog Logging, Panic Recovery
+│   │   └── server.go           # net/http ServeMux routing & middleware chaining
+│   ├── model/
+│   │   └── telemetry.go        # TelemetryPayload struct, invariant validation, sync.Pool
 │   ├── repository/
-│   │   └── redis.go        # Redis connection pool and HSET logic (using go-redis/redis/v9)
+│   │   ├── repository.go       # TelemetryRepository interface definition
+│   │   ├── redis.go            # Production Redis HSET/HGetAll pool implementation
+│   │   └── memory.go           # Thread-safe in-memory fallback with sync.RWMutex
 │   └── service/
-│       ├── pool.go         # Worker pool to process ingestion channels concurrently
-│       └── hub.go          # WebSocket broadcasting hub using select and channels
+│       ├── hub.go              # Gorilla WebSocket broadcasting hub with non-blocking drop
+│       └── worker.go           # Asynchronous worker pool consuming buffered ingestion queue
+├── go.mod                      # Module: github.com/shubhojit-mitra-dev/iiot-telemetry
+└── go.sum                      # Verified checksums for gorilla/websocket & go-redis
 ```
 
 ## 3. Detailed Component Implementations
 
-### A. Data Models & `sync.Pool` (`internal/models/telemetry.go`)
-- Define `TelemetryPayload`: DeviceID (string), Timestamp (int64), Temperature (float64), Vibration (float64), RPM (int64).
-- **Crucial:** Implement a `sync.Pool` for `TelemetryPayload`. During high throughput (10,000+ req/sec), instantiating a new struct for every request will kill performance via GC pauses.
-- Create `GetPayload() *TelemetryPayload` and `PutPayload(p *TelemetryPayload)` functions.
+### A. Data Models & `sync.Pool` (`app/model/telemetry.go`)
+- `TelemetryPayload`: `DeviceID` (string), `Timestamp` (int64), `Temperature` (float64), `Vibration` (float64), `RPM` (int64).
+- **sync.Pool:** `payloadPool` recycles instances. `GetPayload() *TelemetryPayload` retrieves from pool; `PutPayload(p)` zeroes fields and returns struct to pool.
+- **Validation:** `Validate()` checks `DeviceID != ""` and `Timestamp > 0`.
+- **Clone:** `Clone()` creates an independent stack/heap copy before recycling the original back to the pool.
 
-### B. The Ingestion Handler (`internal/api/ingest.go`)
+### B. The Ingestion Handler (`app/api/handler.go`)
 - **Route:** `POST /api/v1/telemetry`
 - **Logic:**
-  1. Acquire a `TelemetryPayload` from the `sync.Pool`.
-  2. Use `json.NewDecoder(r.Body).Decode(payload)`. Do not use `ioutil.ReadAll` (it allocates memory dynamically).
-  3. Validate fields (DeviceID cannot be empty, Timestamp > 0).
-  4. If invalid, release to pool and return `400 Bad Request`.
-  5. If valid, send a **copy** of the data to the `IngestChannel` and immediately release the struct back to the `sync.Pool`.
-  6. Return `202 Accepted` and cleanly close the request body.
+  1. Acquire `TelemetryPayload` from `sync.Pool`.
+  2. Stream via `json.NewDecoder(r.Body).Decode(payload)`. (Zero `ioutil.ReadAll` allocation).
+  3. Validate fields. On error, return `400 Bad Request`.
+  4. Submit `payload.Clone()` to worker queue via `Submit()`. If queue is saturated, return `503 Service Unavailable`.
+  5. Return `202 Accepted` (`{"status":"accepted"}`). Defer `PutPayload(payload)` releases struct immediately.
 
-### C. Worker Pool & Redis Repository (`internal/service/pool.go` & `internal/repository/redis.go`)
-- **Worker Pool:** Initialize a buffered channel `IngestChannel = make(chan TelemetryPayload, 10000)`.
-- Spawn a fixed number of goroutines (e.g., `runtime.NumCPU() * 2`) that constantly read from `IngestChannel`.
-- **Redis Writes:** For every payload received from the channel, call `redis.SaveLatestTelemetry`.
-- **Redis Details:** Use `go-redis/v9`. Store data as `HSET device:latest:<DeviceID>`. Utilize Redis Pipelining if the worker batch-reads from the channel, otherwise direct `HSET` is fine since workers run concurrently.
+### C. Repository Layer (`app/repository/`)
+- `TelemetryRepository` interface defines `SaveLatest`, `GetLatest`, `GetAllLatest`, `Close`.
+- **Redis (`redis.go`):** Stores latest telemetry frame as Redis Hash under key `device:latest:<device_id>`. Pool size: 100 connections.
+- **Memory (`memory.go`):** In-memory map protected by `sync.RWMutex`. Used when Redis is unreachable, guaranteeing zero-downtime local development.
 
-### D. WebSocket Hub (`internal/service/hub.go`)
-- Use `github.com/gorilla/websocket` (de-facto standard for WS, highly optimized).
-- The Hub must maintain `Clients map[*Client]bool`.
-- Use a `broadcast` channel. The Hub runs in a single goroutine using the strict `select` pattern:
-  ```go
-  select {
-  case client := <-hub.register:
-      hub.clients[client] = true
-  case client := <-hub.unregister:
-      if _, ok := hub.clients[client]; ok {
-          delete(hub.clients, client)
-          close(client.send)
-      }
-  case message := <-hub.broadcast:
-      for client := range hub.clients {
-          // non-blocking send
-          select {
-          case client.send <- message:
-          default:
-              close(client.send)
-              delete(hub.clients, client)
-          }
-      }
-  }
-  ```
-- **Zero-Block Broadcasting:** The `default` case above is critical. If a client's network is slow, its channel buffer fills up. We must drop the client immediately rather than blocking the entire broadcast loop for thousands of other devices.
+### D. Worker Pool (`app/service/worker.go`)
+- Buffered channel `queue = make(chan TelemetryPayload, 10000)`.
+- Spawns `runtime.NumCPU() * 2` worker goroutines.
+- Workers persist to repository, check anomaly thresholds (`Temperature > 120°C` or `Vibration > 12.0 mm/s`), and broadcast via WebSocket Hub.
+- `Stop()` cleanly closes queue and waits for all in-flight items with `sync.WaitGroup`.
 
-## 4. Error Handling & Logging
-- Do not use `panic`. Handle all errors gracefully.
-- Use `log/slog` (introduced in Go 1.21) for highly optimized, zero-allocation structured JSON logging.
+### E. WebSocket Hub (`app/service/hub.go`)
+- Manages active client map with Gorilla WebSocket.
+- Non-blocking broadcast loop using `select` + `default`. If a client channel buffer (256 messages) is full, it is dropped immediately to protect the broadcast loop from stalling.
+- Read/write pumps with automated ping/pong heartbeats to cleanly detect client disconnects.
 
-## 5. Next Steps for Implementation
-1. Initialize module `github.com/mitra/iiot-telemetry/backend`.
-2. Build the `TelemetryPayload` pool.
-3. Build the HTTP server, routing, and Worker Pool.
-4. Implement Redis connection and asynchronous HSET operations.
-5. Benchmark locally to ensure minimal GC allocation on the hot path.
+## 4. Testing & Verification Standards
+- Strict adherence to FIRST principles (Fast, Independent, Repeatable, Self-validating, Timely).
+- Table-driven unit tests for validation, models, handlers, and repositories.
+- Benchmark tests verifying `sync.Pool` zero-allocation performance against standard heap allocation.
+- Concurrency race condition detection via `go test -race ./...`.
+- Code coverage enforced at >= 80% across all packages.
