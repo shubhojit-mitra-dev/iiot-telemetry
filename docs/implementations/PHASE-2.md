@@ -21,17 +21,22 @@ Phase 2 focuses on connecting the components. We will replace the mock data with
 ### 2.1 Edge Machinery Simulator (Go CLI)
 We need a robust way to generate synthetic, realistic factory data to stress-test the ingestion server and drive the dashboard.
 
+**Decision: Custom Go Simulator vs. K6**
+While `k6` is the industry standard for raw HTTP throughput load testing, generating stateful, realistic physical telemetry (e.g., a gradual 5-minute temperature drift on a specific CNC machine) is complex in JS. We opted for a **Custom Go Simulator** because it allows us to reuse our `TelemetryPayload` structs natively, write realistic "physics" logic to inject targeted anomalies (e.g., bearing failures), and simulate complex state transitions over time. This makes the demo dashboard look highly realistic. A separate K6 script may be added later purely for benchmark proofs.
+
 *   **Location:** `cmd/simulator/main.go`
 *   **Architecture:**
     *   Initialize 10 distinct virtual machines (e.g., `TURB-001`, `PUMP-002`) mirroring the frontend's expected devices.
-    *   Spawn a dedicated goroutine for each machine.
+    *   Spawn a dedicated goroutine for each machine to maintain persistent physical state (temperature, vibration).
     *   Each goroutine runs a ticker (configurable interval, e.g., 100ms - 1000ms).
-    *   On every tick, generate a `TelemetryPayload` with realistic baseline metrics + Gaussian noise.
-    *   Inject occasional anomalies (e.g., temperature spikes > 120°C) based on a probability threshold.
+    *   On every tick, calculate the next physical state with gradual drift, Gaussian noise, and programmable anomaly injection.
     *   Use `net/http` Client to `POST` the JSON payload to `http://localhost:8080/api/v1/telemetry`.
     *   Handle graceful shutdown (`SIGINT`) to stop the simulator cleanly.
 
-### 2.2 React Frontend Integration
+### 2.2 Future Plan: Athena Monaco Integration
+*Note: As agreed, querying AWS Athena via an embedded Monaco SQL Editor inside the dashboard tab is a brilliant way to maintain context during the demo. This feature has been formally added to the PRD (Phase 6) and will be implemented once the core real-time pipeline is fully stable.*
+
+### 2.3 React Frontend Integration
 The frontend currently uses `setInterval` to mock data. We will rewrite the telemetry hook to consume real network data.
 
 *   **Target:** `src/hooks/useTelemetryStream.ts` (and relevant components).

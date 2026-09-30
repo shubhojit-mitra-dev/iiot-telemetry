@@ -45,7 +45,7 @@ What the interviewer will see and interact with:
 1.  **The "Command Center" Dashboard (React/Vite):** A dark-mode UI displaying a fleet of 10 virtual industrial machines.
 2.  **Live Telemetry Streams:** Flowing charts showing Temperature and Vibration metrics updating in real-time without browser lag.
 3.  **Instant AI Anomaly Alerts:** When a machine spikes above 120°C, the UI flashes red, and an AI-generated diagnostic message (via OpenRouter/Claude/Llama) appears instantly explaining the likely mechanical failure.
-4.  **The Data Lake Query:** A demonstration in the AWS Console showing the raw data landing in S3, the Glue Catalog schema, and a successful Athena SQL query calculating historical rolling averages.
+4.  **Integrated Data Lake Query (Athena):** A dedicated tab in the dashboard featuring an embedded Monaco code editor configured for SQL. The user can write and execute AWS Athena queries directly within the UI without ever leaving the dashboard or logging into the AWS Console.
 
 ---
 
@@ -60,13 +60,13 @@ What the interviewer will see and interact with:
     *   Implement WebSocket upgrader and broadcast hub.
 *   **Expected Output:** A local Go server that can receive JSON, update Redis, and broadcast to a local WebSocket test client.
 
-### Phase 2: AI Integration & Edge Simulator (Hours 3-5)
-*   **Focus:** Traffic generation and AI diagnostics.
+### Phase 2: Edge Simulator & Frontend Integration (Hours 3-5)
+*   **Focus:** Realistic physical traffic generation and WebSocket wiring.
 *   **Tasks:**
-    *   Write `simulator.go`: Spawns 10 goroutines sending 50ms interval data with a 2% chance of an anomaly (Temp > 120).
-    *   Integrate OpenRouter API in the Backend: When anomaly detected, fetch a 2-sentence diagnostic and broadcast to UI.
+    *   Write a **Custom Go Simulator** (`cmd/simulator/main.go`): Spawns realistic edge device actors that maintain physical state (temperature, vibration) with gradual drift and programmable anomaly injection (e.g., CNC bearing failure) to drive real value on the dashboard.
+    *   Connect the React frontend to the Go WebSocket hub.
     *   Integrate Amazon Kinesis Firehose SDK in the Backend (Cold path drop-off).
-*   **Expected Output:** A functioning simulator blasting data at the Go server. The Go server correctly identifies anomalies, fetches AI insights, and pushes to Firehose.
+*   **Expected Output:** A functioning simulator blasting realistic stateful data at the Go server. The React UI connects via WebSocket and visualizes this data live.
 
 ### Phase 3: Infrastructure as Code (Hours 5-7)
 *   **Focus:** Cloud provisioning using DevOps best practices.
@@ -95,11 +95,11 @@ What the interviewer will see and interact with:
     *   Deploy Frontend to Vercel (or S3/CloudFront).
 *   **Expected Output:** The system is live on the internet. The Go simulator running on your local machine is successfully hitting the public AWS ALB endpoint, and the public React URL shows the live data.
 
-### Phase 6: Data Engineering & Final Polish (Hours 10-12)
-*   **Focus:** The Medallion Lakehouse proof and interview prep.
+### Phase 6: Data Engineering & Athena Monaco Integration (Hours 10-12)
+*   **Focus:** The Medallion Lakehouse proof, integrated SQL Editor, and interview prep.
 *   **Tasks:**
-    *   Go to AWS Console -> AWS Glue. Run a Crawler over the `telemetry-bronze-lake` S3 bucket.
-    *   Verify the schema in the Data Catalog.
-    *   Open Amazon Athena. Write and save 2-3 complex SQL queries (e.g., aggregations, standard deviations).
+    *   AWS Glue: Run a Crawler over the `telemetry-bronze-lake` S3 bucket to verify schema.
+    *   **Backend Athena Proxy:** Build a Go endpoint (`POST /api/query`) using `aws-sdk-go-v2/service/athena` to trigger and poll Athena query execution.
+    *   **Frontend Monaco Tab:** Integrate `@monaco-editor/react` to provide a full SQL editing experience on the dashboard that calls the proxy endpoint and renders results in a data grid.
     *   End-to-end testing, UI polish, and preparing the defense narrative.
-*   **Expected Output:** A fully finished project. S3 contains partitioned data, Athena can query it, the dashboard is flawless, and AI alerts are functioning. Ready for the interview.
+*   **Expected Output:** A fully finished project. S3 contains partitioned data, Athena can query it, the dashboard features a live SQL editor, and AI alerts are functioning. Ready for the interview.
