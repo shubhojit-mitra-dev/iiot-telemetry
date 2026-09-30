@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/shubhojit-mitra-dev/iiot-telemetry/app/model"
 	"github.com/shubhojit-mitra-dev/iiot-telemetry/app/repository"
 	"github.com/shubhojit-mitra-dev/iiot-telemetry/app/service"
@@ -220,4 +222,19 @@ func TestServerE2ERouting(t *testing.T) {
 		t.Fatalf("expected 200 OK from devices endpoint, got %d", getResp.StatusCode)
 	}
 	_ = getResp.Body.Close()
+}
+
+func TestHandleWebSocket(t *testing.T) {
+	handler, _, _, _, cleanup := setupTestApp(t)
+	defer cleanup()
+
+	server := httptest.NewServer(http.HandlerFunc(handler.HandleWebSocket))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("failed to dial websocket endpoint: %v", err)
+	}
+	defer ws.Close()
 }
