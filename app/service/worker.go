@@ -67,7 +67,10 @@ func (s *IngestionService) worker(ctx context.Context, id int) {
 			// Drain remaining queued items before full termination
 			for {
 				select {
-				case payload := <-s.queue:
+				case payload, ok := <-s.queue:
+					if !ok {
+						return
+					}
 					s.processPayload(context.Background(), payload)
 				default:
 					return
