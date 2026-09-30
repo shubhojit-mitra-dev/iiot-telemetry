@@ -88,20 +88,30 @@ func (h *Hub) Run(ctx context.Context) {
 			slog.Debug("websocket client unregistered", "active_clients", len(h.clients))
 
 		case message := <-h.broadcast:
+			var slowClients []*Client
 			h.mu.RLock()
 			for client := range h.clients {
 				select {
 				case client.send <- message:
 				default:
-					// Zero-block guarantee: drop slow clients whose send buffers are full
-					close(client.send)
-					if client.conn != nil {
-						_ = client.conn.Close()
-					}
-					delete(h.clients, client)
+					slowClients = append(slowClients, client)
 				}
 			}
 			h.mu.RUnlock()
+
+			if len(slowClients) > 0 {
+				h.mu.Lock()
+				for _, client := range slowClients {
+					if _, ok := h.clients[client]; ok {
+						delete(h.clients, client)
+						close(client.send)
+						if client.conn != nil {
+							_ = client.conn.Close()
+						}
+					}
+				}
+				h.mu.Unlock()
+			}
 		}
 	}
 }
