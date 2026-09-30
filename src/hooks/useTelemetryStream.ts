@@ -146,12 +146,17 @@ export function useTelemetryStream() {
         nl[d.id] = p;
         if (p.temperature > 120) {
           incCount.current++;
-          setIncidents(prev => [{
-            id: `inc-${incCount.current}`, device_id: d.id, device_name: d.name,
-            timestamp: ts, temperature: p.temperature, vibration: p.vibration,
+          const newIncident: Incident = {
+            id: `inc-${incCount.current}`,
+            device_id: d.id,
+            device_name: d.name,
+            timestamp: ts,
+            temperature: p.temperature,
+            vibration: p.vibration,
             severity: p.temperature > 130 ? 'critical' : 'warning',
             message: AI_DIAGNOSTICS[Math.floor(Math.random() * AI_DIAGNOSTICS.length)],
-          }, ...prev].slice(0, 50));
+          };
+          setIncidents(prev => [newIncident, ...prev].slice(0, 50));
         }
       }
       msgCount.current += DEVICES.length;
