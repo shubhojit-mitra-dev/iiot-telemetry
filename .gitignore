@@ -4,3 +4,5 @@ start-dev.ps1
 node_modules/
 dist/
 *.exe
+coverage.out
+coverage
