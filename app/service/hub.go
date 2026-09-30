@@ -61,7 +61,9 @@ func (h *Hub) Run(ctx context.Context) {
 			h.mu.Lock()
 			for client := range h.clients {
 				close(client.send)
-				_ = client.conn.Close()
+				if client.conn != nil {
+					_ = client.conn.Close()
+				}
 				delete(h.clients, client)
 			}
 			h.mu.Unlock()
@@ -78,7 +80,9 @@ func (h *Hub) Run(ctx context.Context) {
 			if _, ok := h.clients[client]; ok {
 				delete(h.clients, client)
 				close(client.send)
-				_ = client.conn.Close()
+				if client.conn != nil {
+					_ = client.conn.Close()
+				}
 			}
 			h.mu.Unlock()
 			slog.Debug("websocket client unregistered", "active_clients", len(h.clients))
@@ -91,7 +95,9 @@ func (h *Hub) Run(ctx context.Context) {
 				default:
 					// Zero-block guarantee: drop slow clients whose send buffers are full
 					close(client.send)
-					_ = client.conn.Close()
+					if client.conn != nil {
+						_ = client.conn.Close()
+					}
 					delete(h.clients, client)
 				}
 			}
