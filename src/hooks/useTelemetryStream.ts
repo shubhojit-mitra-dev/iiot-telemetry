@@ -1,4 +1,5 @@
-import { useState, useEffect, useRef } from 'react';
+/// <reference types="vite/client" />
+import { useState, useEffect, useRef, useCallback } from 'react';
 
 // --- Device Configuration ---
 export interface DeviceConfig {
@@ -59,30 +60,42 @@ export interface TelemetryStats {
   avgVibration: number;
   avgRpm: number;
   anomalyCount: number;
+  queueDepth: number;
+  activeClients: number;
 }
 
 export type ChartDataPoint = { timestamp: number; [deviceId: string]: number };
 
-// --- AI Diagnostics ---
-const AI_DIAGNOSTICS = [
-  'Potential bearing degradation detected. Synchronous temperature rise with vibration spike suggests inner race wear. Recommend immediate lubrication system inspection.',
+// --- AI Diagnostic Context Engine ---
+const AI_DIAGNOSTICS_TEMP = [
   'Thermal runaway pattern identified. Excessive heat generation correlates with RPM instability. Possible motor winding fault — schedule preventive shutdown.',
-  'Cavitation signature detected in vibration spectrum. Temperature anomaly consistent with insufficient coolant flow. Check impeller and inlet valve.',
-  'Abnormal friction coefficient inferred from heat signature. Vibration harmonics suggest gear mesh fault. Plan replacement during next maintenance window.',
-  'Electrical imbalance detected. Temperature spike with stable RPM indicates potential stator winding short. Isolate circuit and perform insulation resistance test.',
+  'High temperature excursion detected. Heat signature indicates cooling jacket blockage or degraded heat transfer fluid.',
+  'Abnormal friction coefficient inferred from heat signature. Continuous thermal escalation detected. Inspect lubrication level immediately.',
 ];
 
-// --- Data Generator ---
-function generatePayload(device: DeviceConfig, timestamp: number, forceAnomaly = false): TelemetryPayload {
-  const isAnomaly = forceAnomaly || Math.random() < 0.015;
-  return {
-    device_id: device.id,
-    timestamp,
-    temperature: isAnomaly ? 120 + Math.random() * 15 : device.baseTemp + (Math.random() - 0.5) * 8,
-    vibration: isAnomaly ? device.baseVib + 5 + Math.random() * 3 : device.baseVib + (Math.random() - 0.5) * 3,
-    rpm: device.baseRpm + (Math.random() - 0.5) * 200,
-  };
+const AI_DIAGNOSTICS_VIB = [
+  'Potential bearing degradation detected. Vibration harmonics suggest inner race wear and localized flaking. Recommend ultrasonic acoustic inspection.',
+  'Cavitation signature detected in vibration spectrum. Mechanical resonance consistent with pump impeller imbalance or inlet starvation.',
+  'Mechanical misalignment detected. Radial vibration exceedance indicates shaft angular misalignment or loose foundation bolts.',
+];
+
+const AI_DIAGNOSTICS_COMPOUND = [
+  'Critical compound failure imminent. Concurrent temperature rise and severe vibration spike indicate catastrophic bearing seizure in progress.',
+  'Dynamic imbalance with thermal runaway detected. Synchronous vibration harmonics and rapid temperature climb require immediate emergency stop.',
+];
+
+function selectDiagnosticMessage(payload: TelemetryPayload): string {
+  if (payload.temperature > 120 && payload.vibration > 12) {
+    return AI_DIAGNOSTICS_COMPOUND[Math.floor(Math.random() * AI_DIAGNOSTICS_COMPOUND.length)];
+  }
+  if (payload.temperature > 120) {
+    return AI_DIAGNOSTICS_TEMP[Math.floor(Math.random() * AI_DIAGNOSTICS_TEMP.length)];
+  }
+  return AI_DIAGNOSTICS_VIB[Math.floor(Math.random() * AI_DIAGNOSTICS_VIB.length)];
 }
+
+const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8080';
+const WS_URL = import.meta.env.VITE_WS_URL || `${API_BASE.replace(/^http/, 'ws')}/ws/telemetry`;
 
 // --- Hook ---
 export function useTelemetryStream() {
@@ -91,94 +104,272 @@ export function useTelemetryStream() {
   const [rpmSeries, setRpmSeries] = useState<ChartDataPoint[]>([]);
   const [latestByDevice, setLatestByDevice] = useState<Record<string, TelemetryPayload>>({});
   const [incidents, setIncidents] = useState<Incident[]>([]);
+  const [isConnected, setIsConnected] = useState<boolean>(false);
   const [stats, setStats] = useState<TelemetryStats>({
-    activeDevices: 10, totalDevices: 10, messagesIngested: 0,
-    avgTemperature: 0, peakTemperature: 0, avgVibration: 0, avgRpm: 0, anomalyCount: 0,
+    activeDevices: 0,
+    totalDevices: DEVICES.length,
+    messagesIngested: 0,
+    avgTemperature: 0,
+    peakTemperature: 0,
+    avgVibration: 0,
+    avgRpm: 0,
+    anomalyCount: 0,
+    queueDepth: 0,
+    activeClients: 0,
   });
 
-  const msgCount = useRef(0);
-  const incCount = useRef(0);
+  const wsRef = useRef<WebSocket | null>(null);
+  const retryTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const healthIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const reconnectAttemptRef = useRef<number>(0);
+  const lastIncidentTimeRef = useRef<Record<string, number>>({});
+  const isUnmountedRef = useRef<boolean>(false);
+  const latestByDeviceRef = useRef<Record<string, TelemetryPayload>>({});
 
-  useEffect(() => {
-    const now = Date.now();
-    const initTemp: ChartDataPoint[] = [];
-    const initVib: ChartDataPoint[] = [];
-    const initRpm: ChartDataPoint[] = [];
-    const initLatest: Record<string, TelemetryPayload> = {};
-    const initIncidents: Incident[] = [];
+  // Dense state tracking to ensure all 10 machines have continuous, fluid chart lines
+  const latestMetricsRef = useRef<{
+    temp: Record<string, number>;
+    vib: Record<string, number>;
+    rpm: Record<string, number>;
+  }>({
+    temp: Object.fromEntries(DEVICES.map(d => [d.id, d.baseTemp])),
+    vib: Object.fromEntries(DEVICES.map(d => [d.id, d.baseVib])),
+    rpm: Object.fromEntries(DEVICES.map(d => [d.id, d.baseRpm])),
+  });
 
-    for (let i = 60; i > 0; i--) {
-      const ts = now - i * 1000;
-      const tp: ChartDataPoint = { timestamp: ts };
-      const vp: ChartDataPoint = { timestamp: ts };
-      const rp: ChartDataPoint = { timestamp: ts };
-      for (const d of DEVICES) {
-        const p = generatePayload(d, ts);
-        tp[d.id] = p.temperature;
-        vp[d.id] = p.vibration;
-        rp[d.id] = p.rpm;
-        initLatest[d.id] = p;
-        if (p.temperature > 120) {
-          incCount.current++;
-          initIncidents.push({
-            id: `inc-${incCount.current}`, device_id: d.id, device_name: d.name,
-            timestamp: ts, temperature: p.temperature, vibration: p.vibration,
-            severity: p.temperature > 130 ? 'critical' : 'warning',
-            message: AI_DIAGNOSTICS[Math.floor(Math.random() * AI_DIAGNOSTICS.length)],
-          });
-        }
+  // Buffer incoming points onto sliding window charts (capped at 60 points to eliminate memory leaks)
+  const appendChartPoint = useCallback((payload: TelemetryPayload) => {
+    const ts = payload.timestamp > 1e11 ? payload.timestamp : payload.timestamp * 1000;
+
+    // Update dense metric cache
+    latestMetricsRef.current.temp[payload.device_id] = payload.temperature;
+    latestMetricsRef.current.vib[payload.device_id] = payload.vibration;
+    latestMetricsRef.current.rpm[payload.device_id] = payload.rpm;
+
+    const updateSeries = (
+      prev: ChartDataPoint[],
+      metricKey: 'temp' | 'vib' | 'rpm'
+    ): ChartDataPoint[] => {
+      const last = prev[prev.length - 1];
+      const snapshot = latestMetricsRef.current[metricKey];
+
+      // Merge into current time bucket (500ms window) to group asynchronous fleet arrivals
+      if (last && Math.abs(last.timestamp - ts) < 500) {
+        const updated: ChartDataPoint = { ...last, ...snapshot, timestamp: last.timestamp };
+        return [...prev.slice(0, -1), updated];
       }
-      initTemp.push(tp); initVib.push(vp); initRpm.push(rp);
-    }
-    msgCount.current = 60 * DEVICES.length;
-    setTempSeries(initTemp); setVibSeries(initVib); setRpmSeries(initRpm);
-    setLatestByDevice(initLatest); setIncidents(initIncidents.slice(-30));
 
-    const interval = setInterval(() => {
-      const ts = Date.now();
-      const tp: ChartDataPoint = { timestamp: ts };
-      const vp: ChartDataPoint = { timestamp: ts };
-      const rp: ChartDataPoint = { timestamp: ts };
-      const nl: Record<string, TelemetryPayload> = {};
-      for (const d of DEVICES) {
-        const p = generatePayload(d, ts);
-        tp[d.id] = p.temperature; vp[d.id] = p.vibration; rp[d.id] = p.rpm;
-        nl[d.id] = p;
-        if (p.temperature > 120) {
-          incCount.current++;
-          const newIncident: Incident = {
-            id: `inc-${incCount.current}`,
-            device_id: d.id,
-            device_name: d.name,
-            timestamp: ts,
-            temperature: p.temperature,
-            vibration: p.vibration,
-            severity: p.temperature > 130 ? 'critical' : 'warning',
-            message: AI_DIAGNOSTICS[Math.floor(Math.random() * AI_DIAGNOSTICS.length)],
-          };
-          setIncidents(prev => [newIncident, ...prev].slice(0, 50));
-        }
-      }
-      msgCount.current += DEVICES.length;
-      setTempSeries(prev => [...prev, tp].slice(-60));
-      setVibSeries(prev => [...prev, vp].slice(-60));
-      setRpmSeries(prev => [...prev, rp].slice(-60));
-      setLatestByDevice(prev => ({ ...prev, ...nl }));
-      const vals = Object.values(nl);
-      const temps = vals.map(v => v.temperature);
-      const vibs = vals.map(v => v.vibration);
-      const rpms = vals.map(v => v.rpm);
-      setStats({
-        activeDevices: 10, totalDevices: 10, messagesIngested: msgCount.current,
-        avgTemperature: temps.reduce((a, b) => a + b, 0) / temps.length,
-        peakTemperature: Math.max(...temps),
-        avgVibration: vibs.reduce((a, b) => a + b, 0) / vibs.length,
-        avgRpm: rpms.reduce((a, b) => a + b, 0) / rpms.length,
-        anomalyCount: incCount.current,
-      });
-    }, 1000);
-    return () => clearInterval(interval);
+      // Start new time bucket seeded with full fleet state vector
+      const newPoint: ChartDataPoint = { timestamp: ts, ...snapshot };
+      return [...prev, newPoint].slice(-60);
+    };
+
+    setTempSeries(prev => updateSeries(prev, 'temp'));
+    setVibSeries(prev => updateSeries(prev, 'vib'));
+    setRpmSeries(prev => updateSeries(prev, 'rpm'));
   }, []);
 
-  return { tempSeries, vibSeries, rpmSeries, latestByDevice, incidents, stats };
+  // Update aggregated statistics derived from live device snapshot and backend health
+  const refreshStats = useCallback((backendStats?: { processed: number; anomalies: number; queueDepth: number; clients: number }) => {
+    const devices = Object.values(latestByDeviceRef.current);
+    const activeCount = devices.length;
+
+    if (activeCount > 0) {
+      const temps = devices.map(d => d.temperature);
+      const vibs = devices.map(d => d.vibration);
+      const rpms = devices.map(d => d.rpm);
+
+      const avgTemp = temps.reduce((a, b) => a + b, 0) / activeCount;
+      const peakTemp = Math.max(...temps);
+      const avgVib = vibs.reduce((a, b) => a + b, 0) / activeCount;
+      const avgRpmVal = rpms.reduce((a, b) => a + b, 0) / activeCount;
+
+      setStats(prev => ({
+        ...prev,
+        activeDevices: activeCount,
+        totalDevices: DEVICES.length,
+        messagesIngested: backendStats ? backendStats.processed : prev.messagesIngested,
+        anomalyCount: backendStats ? backendStats.anomalies : prev.anomalyCount,
+        queueDepth: backendStats ? backendStats.queueDepth : prev.queueDepth,
+        activeClients: backendStats ? backendStats.clients : prev.activeClients,
+        avgTemperature: avgTemp,
+        peakTemperature: peakTemp,
+        avgVibration: avgVib,
+        avgRpm: avgRpmVal,
+      }));
+    } else if (backendStats) {
+      setStats(prev => ({
+        ...prev,
+        messagesIngested: backendStats.processed,
+        anomalyCount: backendStats.anomalies,
+        queueDepth: backendStats.queueDepth,
+        activeClients: backendStats.clients,
+      }));
+    }
+  }, []);
+
+  // Poll backend health stats every 3 seconds for accurate server-side throughput and queue telemetry
+  const fetchHealthStats = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/health`);
+      if (!res.ok) return;
+      const data = await res.json();
+      refreshStats({
+        processed: data.total_processed ?? 0,
+        anomalies: data.anomalies ?? 0,
+        queueDepth: data.queue_depth ?? 0,
+        clients: data.active_clients ?? 0,
+      });
+    } catch {
+      // Backend temporarily offline or unreachable
+    }
+  }, [refreshStats]);
+
+  // Initial devices state fetch on mount
+  const fetchInitialDevices = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/devices`);
+      if (!res.ok) return;
+      const devicesMap: Record<string, TelemetryPayload> = await res.json();
+      if (devicesMap && Object.keys(devicesMap).length > 0) {
+        latestByDeviceRef.current = devicesMap;
+        setLatestByDevice(devicesMap);
+
+        // Prepopulate initial charts from snapshot
+        const ts = Date.now();
+        const initialTemp: ChartDataPoint = { timestamp: ts };
+        const initialVib: ChartDataPoint = { timestamp: ts };
+        const initialRpm: ChartDataPoint = { timestamp: ts };
+
+        Object.values(devicesMap).forEach(payload => {
+          initialTemp[payload.device_id] = payload.temperature;
+          initialVib[payload.device_id] = payload.vibration;
+          initialRpm[payload.device_id] = payload.rpm;
+        });
+
+        setTempSeries([initialTemp]);
+        setVibSeries([initialVib]);
+        setRpmSeries([initialRpm]);
+      }
+    } catch {
+      // Server not yet running or empty initial repository
+    }
+  }, []);
+
+  // Connect and maintain resilient WebSocket subscription
+  const connectWebSocket = useCallback(() => {
+    if (isUnmountedRef.current) return;
+
+    try {
+      const ws = new WebSocket(WS_URL);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        if (isUnmountedRef.current) {
+          ws.close();
+          return;
+        }
+        setIsConnected(true);
+        reconnectAttemptRef.current = 0;
+      };
+
+      ws.onmessage = (event: MessageEvent) => {
+        try {
+          const payload: TelemetryPayload = JSON.parse(event.data);
+          if (!payload.device_id) return;
+
+          // 1. Update latest state per device
+          latestByDeviceRef.current[payload.device_id] = payload;
+          setLatestByDevice(prev => ({
+            ...prev,
+            [payload.device_id]: payload,
+          }));
+
+          // 2. Append to rolling chart buffers
+          appendChartPoint(payload);
+
+          // 3. Local Anomaly & AI Diagnostics Alert Detection (debounced per device)
+          if (payload.temperature > 120 || payload.vibration > 12) {
+            const now = Date.now();
+            const lastLog = lastIncidentTimeRef.current[payload.device_id] || 0;
+            if (now - lastLog > 4000) { // 4-second incident debounce per device
+              lastIncidentTimeRef.current[payload.device_id] = now;
+              const deviceMeta = DEVICES.find(d => d.id === payload.device_id);
+              const incident: Incident = {
+                id: `inc-${now}-${payload.device_id}`,
+                device_id: payload.device_id,
+                device_name: deviceMeta ? deviceMeta.name : payload.device_id,
+                timestamp: payload.timestamp > 1e11 ? payload.timestamp : payload.timestamp * 1000,
+                temperature: payload.temperature,
+                vibration: payload.vibration,
+                severity: payload.temperature > 130 || payload.vibration > 14 ? 'critical' : 'warning',
+                message: selectDiagnosticMessage(payload),
+              };
+              setIncidents(prev => [incident, ...prev].slice(0, 50));
+            }
+          }
+
+          // 4. Update stats
+          refreshStats();
+        } catch {
+          // Malformed WebSocket message
+        }
+      };
+
+      ws.onclose = () => {
+        setIsConnected(false);
+        if (isUnmountedRef.current) return;
+
+        // Exponential backoff reconnection: 1s, 1.5s, 2.25s ... max 10s
+        const backoffMs = Math.min(1000 * Math.pow(1.5, reconnectAttemptRef.current), 10000);
+        reconnectAttemptRef.current += 1;
+        retryTimeoutRef.current = setTimeout(connectWebSocket, backoffMs);
+      };
+
+      ws.onerror = () => {
+        ws.close();
+      };
+    } catch {
+      setIsConnected(false);
+      if (isUnmountedRef.current) return;
+      if (retryTimeoutRef.current) clearTimeout(retryTimeoutRef.current);
+      const backoffMs = Math.min(1000 * Math.pow(1.5, reconnectAttemptRef.current), 10000);
+      reconnectAttemptRef.current += 1;
+      retryTimeoutRef.current = setTimeout(connectWebSocket, backoffMs);
+    }
+  }, [appendChartPoint, refreshStats]);
+
+  useEffect(() => {
+    isUnmountedRef.current = false;
+
+    // 1. Initial State Load
+    fetchInitialDevices();
+    fetchHealthStats();
+
+    // 2. Periodic Health Poll
+    healthIntervalRef.current = setInterval(fetchHealthStats, 3000);
+
+    // 3. Connect Real-Time WebSocket Hub
+    connectWebSocket();
+
+    return () => {
+      isUnmountedRef.current = true;
+      if (retryTimeoutRef.current) clearTimeout(retryTimeoutRef.current);
+      if (healthIntervalRef.current) clearInterval(healthIntervalRef.current);
+      if (wsRef.current) {
+        wsRef.current.close(1000, 'Component unmounted');
+        wsRef.current = null;
+      }
+    };
+  }, [fetchInitialDevices, fetchHealthStats, connectWebSocket]);
+
+  return {
+    tempSeries,
+    vibSeries,
+    rpmSeries,
+    latestByDevice,
+    incidents,
+    stats,
+    isConnected,
+  };
 }

@@ -10,7 +10,7 @@ type Tab = 'overview' | 'fleet' | 'incidents';
 
 function App() {
   const [activeTab, setActiveTab] = useState<Tab>('overview');
-  const { tempSeries, vibSeries, rpmSeries, latestByDevice, incidents, stats } = useTelemetryStream();
+  const { tempSeries, vibSeries, rpmSeries, latestByDevice, incidents, stats, isConnected } = useTelemetryStream();
 
   return (
     <div className="min-h-screen bg-[#0B0C10] antialiased">
@@ -53,12 +53,14 @@ function App() {
           <div className="flex items-center gap-4">
             <div className="flex items-center gap-1.5 text-xs">
               <span className="relative flex h-2 w-2">
-                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-[#56A64B] opacity-75"></span>
-                <span className="relative inline-flex h-2 w-2 rounded-full bg-[#56A64B]"></span>
+                <span className={`absolute inline-flex h-full w-full animate-ping rounded-full ${isConnected ? 'bg-[#56A64B]' : 'bg-[#FADE2A]'} opacity-75`}></span>
+                <span className={`relative inline-flex h-2 w-2 rounded-full ${isConnected ? 'bg-[#56A64B]' : 'bg-[#FADE2A]'}`}></span>
               </span>
-              <span className="font-mono text-[#56A64B] text-[10px] font-bold tracking-wider">LIVE</span>
+              <span className={`font-mono text-[10px] font-bold tracking-wider ${isConnected ? 'text-[#56A64B]' : 'text-[#FADE2A]'}`}>
+                {isConnected ? 'LIVE WS' : 'CONNECTING'}
+              </span>
             </div>
-            <span className="text-[10px] font-mono text-[#9FA7B3]">{DEVICES.length} nodes · 1s interval</span>
+            <span className="text-[10px] font-mono text-[#9FA7B3]">{DEVICES.length} nodes · Go Pipeline</span>
           </div>
         </div>
       </header>
@@ -77,7 +79,7 @@ function App() {
                   title="Active Nodes"
                   value={`${stats.activeDevices}/${stats.totalDevices}`}
                   status="info"
-                  subtitle="All systems operational"
+                  subtitle={stats.activeDevices === stats.totalDevices ? 'All fleet online' : `${stats.activeDevices} transmitting`}
                 />
               </div>
               <div className="col-span-12 sm:col-span-6 lg:col-span-2">
@@ -85,7 +87,7 @@ function App() {
                   title="Messages Ingested"
                   value={stats.messagesIngested.toLocaleString()}
                   status="normal"
-                  subtitle={`${DEVICES.length} msg/s throughput`}
+                  subtitle={stats.queueDepth > 0 ? `Queue Depth: ${stats.queueDepth}` : `${stats.activeClients} WS Client${stats.activeClients !== 1 ? 's' : ''}`}
                 />
               </div>
               <div className="col-span-12 sm:col-span-6 lg:col-span-2">
@@ -117,7 +119,7 @@ function App() {
                   title="Anomalies Detected"
                   value={stats.anomalyCount}
                   status={stats.anomalyCount > 0 ? 'critical' : 'normal'}
-                  subtitle="Since session start"
+                  subtitle="Server detected"
                 />
               </div>
             </div>

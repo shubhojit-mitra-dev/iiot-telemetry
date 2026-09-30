@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"fmt"
+	"net"
 	"strconv"
 
 	"github.com/redis/go-redis/v9"
@@ -16,15 +17,25 @@ type RedisRepository struct {
 
 // NewRedisRepository establishes a connection pool to Redis and validates connectivity.
 func NewRedisRepository(ctx context.Context, addr string, password string, db int) (*RedisRepository, error) {
+	// Fast TCP probe to avoid connection pool retry storm if Redis is offline
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to reach redis at %s: %w", addr, err)
+	}
+	_ = conn.Close()
+
 	rdb := redis.NewClient(&redis.Options{
 		Addr:         addr,
 		Password:     password,
 		DB:           db,
 		PoolSize:     100, // Handle high concurrency worker connections
-		MinIdleConns: 10,
+		MinIdleConns: 5,
+		MaxRetries:   1, // Minimize retry noise when testing connectivity
 	})
 
 	if err := rdb.Ping(ctx).Err(); err != nil {
+		_ = rdb.Close()
 		return nil, fmt.Errorf("failed to ping redis at %s: %w", addr, err)
 	}
 

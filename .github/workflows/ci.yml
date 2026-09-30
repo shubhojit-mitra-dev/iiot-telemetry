@@ -1,0 +1,82 @@
+name: DevSecOps CI Pipeline
+
+on:
+  push:
+    branches: [ main, master, "feature/**" ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  backend-devsecops:
+    name: Backend Test, Coverage & Security
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Setup Go Runtime
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          check-latest: true
+          cache: true
+
+      - name: Verify Go Module Integrity
+        run: |
+          go mod verify
+
+      - name: Static Code Analysis (Go Vet)
+        run: |
+          go vet ./...
+
+      - name: Vulnerability Scanning (Govulncheck)
+        continue-on-error: true
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+      - name: Run Tests with Race Detector & Coverage
+        run: |
+          go test -race -v -covermode=atomic -coverprofile=coverage.out ./app/...
+
+      - name: Enforce Strict 80%+ Code Coverage Gate
+        run: |
+          TOTAL_COVERAGE=$(go tool cover -func=coverage.out | grep "total:" | awk '{print $3}' | tr -d '%')
+          echo "=========================================="
+          echo "Total Statement Test Coverage: ${TOTAL_COVERAGE}%"
+          echo "Required Minimum Threshold:    80.0%"
+          echo "=========================================="
+          awk -v cov="$TOTAL_COVERAGE" 'BEGIN {
+            if (cov + 0 < 80.0) {
+              printf "ERROR: Test coverage (%.2f%%) is below the required 80.0%% threshold!\n", cov;
+              exit 1;
+            } else {
+              printf "SUCCESS: Test coverage (%.2f%%) meets or exceeds the 80.0%% threshold.\n", cov;
+            }
+          }'
+
+      - name: Upload Test Coverage Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-coverage-report
+          path: coverage.out
+
+  frontend-quality:
+    name: Frontend Typecheck & Build Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js Runtime
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Validate TypeScript Compilation & Production Build
+        run: npm run build

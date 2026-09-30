@@ -19,6 +19,8 @@ type IngestionService struct {
 	wg           sync.WaitGroup
 	processedCnt atomic.Uint64
 	anomalyCnt   atomic.Uint64
+	mu           sync.RWMutex
+	closed       bool
 }
 
 // NewIngestionService initializes the ingestion pipeline with buffered channel and worker routines.
@@ -48,7 +50,16 @@ func (s *IngestionService) Start(ctx context.Context) {
 }
 
 // Submit enqueues a payload for asynchronous processing without blocking the HTTP request thread.
+// It returns false if the queue is saturated or the service is shutting down.
 func (s *IngestionService) Submit(payload model.TelemetryPayload) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.closed {
+		slog.Warn("ingestion service stopping, rejecting payload", "device_id", payload.DeviceID)
+		return false
+	}
+
 	select {
 	case s.queue <- payload:
 		return true
@@ -61,25 +72,8 @@ func (s *IngestionService) Submit(payload model.TelemetryPayload) bool {
 func (s *IngestionService) worker(ctx context.Context, id int) {
 	defer s.wg.Done()
 
-	for {
-		select {
-		case <-ctx.Done():
-			// Drain remaining queued items before full termination
-			for {
-				select {
-				case payload := <-s.queue:
-					s.processPayload(context.Background(), payload)
-				default:
-					return
-				}
-			}
-
-		case payload, ok := <-s.queue:
-			if !ok {
-				return
-			}
-			s.processPayload(ctx, payload)
-		}
+	for payload := range s.queue {
+		s.processPayload(ctx, payload)
 	}
 }
 
@@ -110,7 +104,15 @@ func (s *IngestionService) processPayload(ctx context.Context, payload model.Tel
 
 // Stop closes the queue and waits for all in-flight jobs to be flushed.
 func (s *IngestionService) Stop() {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+	s.closed = true
 	close(s.queue)
+	s.mu.Unlock()
+
 	s.wg.Wait()
 	slog.Info("ingestion worker pool gracefully stopped", "total_processed", s.processedCnt.Load())
 }

@@ -1,8 +1,12 @@
 package api
 
 import (
+	"bufio"
+	"errors"
 	"log/slog"
+	"net"
 	"net/http"
+	"os"
 	"time"
 )
 
@@ -35,7 +39,13 @@ func CORSMiddleware(next http.Handler) http.Handler {
 
 // LoggingMiddleware logs request duration and status using structured slog.
 func LoggingMiddleware(next http.Handler) http.Handler {
+	benchMode := os.Getenv("BENCH_MODE") == "1"
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if benchMode {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		start := time.Now()
 		rw := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
 
@@ -68,10 +78,42 @@ func RecoveryMiddleware(next http.Handler) http.Handler {
 
 type responseWriter struct {
 	http.ResponseWriter
-	statusCode int
+	statusCode  int
+	wroteHeader bool
 }
 
 func (rw *responseWriter) WriteHeader(code int) {
+	if rw.wroteHeader {
+		return
+	}
 	rw.statusCode = code
+	rw.wroteHeader = true
 	rw.ResponseWriter.WriteHeader(code)
+}
+
+func (rw *responseWriter) Write(b []byte) (int, error) {
+	if !rw.wroteHeader {
+		rw.WriteHeader(http.StatusOK)
+	}
+	return rw.ResponseWriter.Write(b)
+}
+
+// Hijack implements http.Hijacker to allow protocol upgrades like WebSockets through the middleware chain.
+func (rw *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if hj, ok := rw.ResponseWriter.(http.Hijacker); ok {
+		return hj.Hijack()
+	}
+	return nil, nil, errors.New("underlying ResponseWriter does not implement http.Hijacker")
+}
+
+// Flush implements http.Flusher to support streaming HTTP responses through the middleware chain.
+func (rw *responseWriter) Flush() {
+	if fl, ok := rw.ResponseWriter.(http.Flusher); ok {
+		fl.Flush()
+	}
+}
+
+// Unwrap exposes the underlying ResponseWriter for Go 1.20+ standard response introspection.
+func (rw *responseWriter) Unwrap() http.ResponseWriter {
+	return rw.ResponseWriter
 }

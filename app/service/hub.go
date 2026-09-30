@@ -61,7 +61,9 @@ func (h *Hub) Run(ctx context.Context) {
 			h.mu.Lock()
 			for client := range h.clients {
 				close(client.send)
-				_ = client.conn.Close()
+				if client.conn != nil {
+					_ = client.conn.Close()
+				}
 				delete(h.clients, client)
 			}
 			h.mu.Unlock()
@@ -78,24 +80,38 @@ func (h *Hub) Run(ctx context.Context) {
 			if _, ok := h.clients[client]; ok {
 				delete(h.clients, client)
 				close(client.send)
-				_ = client.conn.Close()
+				if client.conn != nil {
+					_ = client.conn.Close()
+				}
 			}
 			h.mu.Unlock()
 			slog.Debug("websocket client unregistered", "active_clients", len(h.clients))
 
 		case message := <-h.broadcast:
+			var slowClients []*Client
 			h.mu.RLock()
 			for client := range h.clients {
 				select {
 				case client.send <- message:
 				default:
-					// Zero-block guarantee: drop slow clients whose send buffers are full
-					close(client.send)
-					_ = client.conn.Close()
-					delete(h.clients, client)
+					slowClients = append(slowClients, client)
 				}
 			}
 			h.mu.RUnlock()
+
+			if len(slowClients) > 0 {
+				h.mu.Lock()
+				for _, client := range slowClients {
+					if _, ok := h.clients[client]; ok {
+						delete(h.clients, client)
+						close(client.send)
+						if client.conn != nil {
+							_ = client.conn.Close()
+						}
+					}
+				}
+				h.mu.Unlock()
+			}
 		}
 	}
 }
@@ -136,7 +152,17 @@ func (h *Hub) ServeWebSocket(w http.ResponseWriter, r *http.Request) {
 		send: make(chan []byte, 256),
 	}
 
-	h.register <- client
+	select {
+	case h.register <- client:
+	case <-r.Context().Done():
+		_ = conn.Close()
+		return
+	default:
+		slog.Warn("websocket registration channel saturated, rejecting client")
+		_ = conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseTryAgainLater, "registration queue saturated"))
+		_ = conn.Close()
+		return
+	}
 
 	go client.writePump()
 	go client.readPump()
@@ -144,7 +170,10 @@ func (h *Hub) ServeWebSocket(w http.ResponseWriter, r *http.Request) {
 
 func (c *Client) readPump() {
 	defer func() {
-		c.hub.unregister <- c
+		select {
+		case c.hub.unregister <- c:
+		default:
+		}
 	}()
 
 	c.conn.SetReadLimit(maxMessageSize)
