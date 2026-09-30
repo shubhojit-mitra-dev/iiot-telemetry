@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -160,12 +161,53 @@ func TestIngestionService_GracefulDraining(t *testing.T) {
 		})
 	}
 
-	// Cancel context to trigger draining mode
+	// Cancel context and stop
 	cancel()
 	svc.Stop()
 
 	processed, _, _ := svc.Stats()
 	if processed != 20 {
 		t.Fatalf("expected all 20 payloads to be drained and processed, got %d", processed)
+	}
+}
+
+func TestIngestionService_ConcurrentSubmitAndStop(t *testing.T) {
+	repo := repository.NewMemoryRepository()
+	defer repo.Close()
+
+	svc := NewIngestionService(repo, nil, 4, 100)
+	svc.Start(context.Background())
+
+	var wg sync.WaitGroup
+	// Run 10 concurrent submitting goroutines
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				_ = svc.Submit(model.TelemetryPayload{
+					DeviceID:    "CONCUR-DEV",
+					Timestamp:   time.Now().UnixMilli(),
+					Temperature: 60.0,
+				})
+			}
+		}(i)
+	}
+
+	// Concurrently stop the service
+	time.Sleep(2 * time.Millisecond)
+	svc.Stop()
+
+	// Wait for submitting goroutines to finish
+	wg.Wait()
+
+	// Any subsequent submit must safely return false without panicking
+	ok := svc.Submit(model.TelemetryPayload{
+		DeviceID:    "LATE-DEV",
+		Timestamp:   time.Now().UnixMilli(),
+		Temperature: 60.0,
+	})
+	if ok {
+		t.Fatal("expected submit to return false after service is stopped")
 	}
 }
