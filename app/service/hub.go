@@ -152,7 +152,17 @@ func (h *Hub) ServeWebSocket(w http.ResponseWriter, r *http.Request) {
 		send: make(chan []byte, 256),
 	}
 
-	h.register <- client
+	select {
+	case h.register <- client:
+	case <-r.Context().Done():
+		_ = conn.Close()
+		return
+	default:
+		slog.Warn("websocket registration channel saturated, rejecting client")
+		_ = conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseTryAgainLater, "registration queue saturated"))
+		_ = conn.Close()
+		return
+	}
 
 	go client.writePump()
 	go client.readPump()
@@ -160,7 +170,10 @@ func (h *Hub) ServeWebSocket(w http.ResponseWriter, r *http.Request) {
 
 func (c *Client) readPump() {
 	defer func() {
-		c.hub.unregister <- c
+		select {
+		case c.hub.unregister <- c:
+		default:
+		}
 	}()
 
 	c.conn.SetReadLimit(maxMessageSize)

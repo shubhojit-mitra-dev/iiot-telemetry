@@ -124,6 +124,7 @@ export function useTelemetryStream() {
   const reconnectAttemptRef = useRef<number>(0);
   const lastIncidentTimeRef = useRef<Record<string, number>>({});
   const isUnmountedRef = useRef<boolean>(false);
+  const latestByDeviceRef = useRef<Record<string, TelemetryPayload>>({});
 
   // Dense state tracking to ensure all 10 machines have continuous, fluid chart lines
   const latestMetricsRef = useRef<{
@@ -170,44 +171,41 @@ export function useTelemetryStream() {
 
   // Update aggregated statistics derived from live device snapshot and backend health
   const refreshStats = useCallback((backendStats?: { processed: number; anomalies: number; queueDepth: number; clients: number }) => {
-    setLatestByDevice(currentDevices => {
-      const devices = Object.values(currentDevices);
-      const activeCount = devices.length;
+    const devices = Object.values(latestByDeviceRef.current);
+    const activeCount = devices.length;
 
-      if (activeCount > 0) {
-        const temps = devices.map(d => d.temperature);
-        const vibs = devices.map(d => d.vibration);
-        const rpms = devices.map(d => d.rpm);
+    if (activeCount > 0) {
+      const temps = devices.map(d => d.temperature);
+      const vibs = devices.map(d => d.vibration);
+      const rpms = devices.map(d => d.rpm);
 
-        const avgTemp = temps.reduce((a, b) => a + b, 0) / activeCount;
-        const peakTemp = Math.max(...temps);
-        const avgVib = vibs.reduce((a, b) => a + b, 0) / activeCount;
-        const avgRpmVal = rpms.reduce((a, b) => a + b, 0) / activeCount;
+      const avgTemp = temps.reduce((a, b) => a + b, 0) / activeCount;
+      const peakTemp = Math.max(...temps);
+      const avgVib = vibs.reduce((a, b) => a + b, 0) / activeCount;
+      const avgRpmVal = rpms.reduce((a, b) => a + b, 0) / activeCount;
 
-        setStats(prev => ({
-          ...prev,
-          activeDevices: activeCount,
-          totalDevices: DEVICES.length,
-          messagesIngested: backendStats ? backendStats.processed : prev.messagesIngested,
-          anomalyCount: backendStats ? backendStats.anomalies : prev.anomalyCount,
-          queueDepth: backendStats ? backendStats.queueDepth : prev.queueDepth,
-          activeClients: backendStats ? backendStats.clients : prev.activeClients,
-          avgTemperature: avgTemp,
-          peakTemperature: peakTemp,
-          avgVibration: avgVib,
-          avgRpm: avgRpmVal,
-        }));
-      } else if (backendStats) {
-        setStats(prev => ({
-          ...prev,
-          messagesIngested: backendStats.processed,
-          anomalyCount: backendStats.anomalies,
-          queueDepth: backendStats.queueDepth,
-          activeClients: backendStats.clients,
-        }));
-      }
-      return currentDevices;
-    });
+      setStats(prev => ({
+        ...prev,
+        activeDevices: activeCount,
+        totalDevices: DEVICES.length,
+        messagesIngested: backendStats ? backendStats.processed : prev.messagesIngested,
+        anomalyCount: backendStats ? backendStats.anomalies : prev.anomalyCount,
+        queueDepth: backendStats ? backendStats.queueDepth : prev.queueDepth,
+        activeClients: backendStats ? backendStats.clients : prev.activeClients,
+        avgTemperature: avgTemp,
+        peakTemperature: peakTemp,
+        avgVibration: avgVib,
+        avgRpm: avgRpmVal,
+      }));
+    } else if (backendStats) {
+      setStats(prev => ({
+        ...prev,
+        messagesIngested: backendStats.processed,
+        anomalyCount: backendStats.anomalies,
+        queueDepth: backendStats.queueDepth,
+        activeClients: backendStats.clients,
+      }));
+    }
   }, []);
 
   // Poll backend health stats every 3 seconds for accurate server-side throughput and queue telemetry
@@ -234,6 +232,7 @@ export function useTelemetryStream() {
       if (!res.ok) return;
       const devicesMap: Record<string, TelemetryPayload> = await res.json();
       if (devicesMap && Object.keys(devicesMap).length > 0) {
+        latestByDeviceRef.current = devicesMap;
         setLatestByDevice(devicesMap);
 
         // Prepopulate initial charts from snapshot
@@ -280,6 +279,7 @@ export function useTelemetryStream() {
           if (!payload.device_id) return;
 
           // 1. Update latest state per device
+          latestByDeviceRef.current[payload.device_id] = payload;
           setLatestByDevice(prev => ({
             ...prev,
             [payload.device_id]: payload,
@@ -331,6 +331,8 @@ export function useTelemetryStream() {
       };
     } catch {
       setIsConnected(false);
+      if (isUnmountedRef.current) return;
+      if (retryTimeoutRef.current) clearTimeout(retryTimeoutRef.current);
       const backoffMs = Math.min(1000 * Math.pow(1.5, reconnectAttemptRef.current), 10000);
       reconnectAttemptRef.current += 1;
       retryTimeoutRef.current = setTimeout(connectWebSocket, backoffMs);
