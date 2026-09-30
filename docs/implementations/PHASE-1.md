@@ -1,69 +1,91 @@
-# Phase 1: Core Ingestion Backend Implementation Details
+# Phase 1: High-Performance Vanilla Go Ingestion Backend
 
-**Target Audience:** Junior Engineers / Implementing Agents
-**Objective:** Build a high-performance Go-based API that captures IIoT telemetry data, buffers it in Redis, and broadcasts it over WebSockets.
+**Target Audience:** Senior/Staff Implementing Agents
+**Objective:** Build an ultra-low latency, highly optimized Go HTTP ingestion server using *only* the Go Standard Library for routing. No Fiber, no Gin, no web frameworks.
 
-## 1. Project Initialization
-- Initialize a new Go module in a `backend/` directory: `go mod init github.com/mitra/iiot-telemetry/backend`
-- Use **Go Fiber** (`github.com/gofiber/fiber/v2`) for the web framework due to its zero-allocation routing and high performance.
-- Use **go-redis** (`github.com/redis/go-redis/v9`) for Redis connectivity.
-- Use Fiber's WebSocket middleware (`github.com/gofiber/websocket/v2`).
+## 1. Architectural Philosophy & Constraints
+- **Zero Web Frameworks:** Use standard `net/http`. 
+- **Memory Optimization:** Pre-allocate all slices. Use `sync.Pool` for struct allocation to prevent garbage collection (GC) thrashing during high-frequency ingestion spikes.
+- **Asynchronous Processing:** The HTTP handler must *never* block for database I/O. Incoming requests are validated and immediately passed into a buffered Go channel. The HTTP handler immediately returns `202 Accepted`. A background Worker Pool consumes the channel to write to Redis.
+- **Graceful Shutdown:** The server must intercept `SIGINT`/`SIGTERM`, stop accepting new requests, flush all channels, close Redis connections, and close WebSocket hubs cleanly.
 
-## 2. Project Structure
-Create the following strict directory structure within `backend/`:
+## 2. Directory Structure (Domain-Driven Design)
 ```text
 backend/
 ├── cmd/
 │   └── server/
-│       └── main.go         # Application entry point
+│       └── main.go         # Bootstrapper, Dependency Injection, Signal handling
 ├── internal/
 │   ├── api/
-│   │   ├── handlers/       # HTTP and WebSocket handlers
-│   │   └── routes.go       # Route definitions
-│   ├── models/             # Data structures (Telemetry Payload)
-│   ├── repository/         # Redis connection and operations
-│   └── service/            # Core business logic (anomaly detection, broadcasting)
+│   │   ├── http.go         # net/http ServeMux and middleware (CORS, Logging, Recover)
+│   │   ├── ingest.go       # POST /api/v1/telemetry handler
+│   │   └── ws.go           # GET /ws/telemetry handler
+│   ├── models/
+│   │   └── telemetry.go    # Data structures with struct tags and sync.Pool definitions
+│   ├── repository/
+│   │   └── redis.go        # Redis connection pool and HSET logic (using go-redis/redis/v9)
+│   └── service/
+│       ├── pool.go         # Worker pool to process ingestion channels concurrently
+│       └── hub.go          # WebSocket broadcasting hub using select and channels
 ```
 
-## 3. Data Models
-Create the core telemetry struct in `internal/models/telemetry.go`:
-```go
-type TelemetryPayload struct {
-    DeviceID    string  `json:"device_id"`
-    Timestamp   int64   `json:"timestamp"`
-    Temperature float64 `json:"temperature"`
-    Vibration   float64 `json:"vibration"`
-    RPM         int64   `json:"rpm"`
-}
-```
+## 3. Detailed Component Implementations
 
-## 4. Implementation Requirements
+### A. Data Models & `sync.Pool` (`internal/models/telemetry.go`)
+- Define `TelemetryPayload`: DeviceID (string), Timestamp (int64), Temperature (float64), Vibration (float64), RPM (int64).
+- **Crucial:** Implement a `sync.Pool` for `TelemetryPayload`. During high throughput (10,000+ req/sec), instantiating a new struct for every request will kill performance via GC pauses.
+- Create `GetPayload() *TelemetryPayload` and `PutPayload(p *TelemetryPayload)` functions.
 
-### A. Redis Repository (`internal/repository/redis.go`)
-- Create a connection pool connecting to a Redis instance (assume `localhost:6379` for local dev).
-- Implement a method `SaveLatestTelemetry(ctx context.Context, payload TelemetryPayload) error`.
-- The Redis key must be formatted as: `device:latest:<DeviceID>`.
-- Use a Redis Hash (`HSET`) to store the fields, allowing quick O(1) retrieval of individual metrics later.
+### B. The Ingestion Handler (`internal/api/ingest.go`)
+- **Route:** `POST /api/v1/telemetry`
+- **Logic:**
+  1. Acquire a `TelemetryPayload` from the `sync.Pool`.
+  2. Use `json.NewDecoder(r.Body).Decode(payload)`. Do not use `ioutil.ReadAll` (it allocates memory dynamically).
+  3. Validate fields (DeviceID cannot be empty, Timestamp > 0).
+  4. If invalid, release to pool and return `400 Bad Request`.
+  5. If valid, send a **copy** of the data to the `IngestChannel` and immediately release the struct back to the `sync.Pool`.
+  6. Return `202 Accepted` and cleanly close the request body.
 
-### B. Ingestion Handler (`internal/api/handlers/ingest.go`)
-- Implement `POST /api/v1/telemetry`.
-- Validate the incoming JSON against the `TelemetryPayload` struct. If invalid, return `400 Bad Request`.
-- Asynchronously (via a goroutine) pass the valid payload to the Service layer to prevent blocking the HTTP response.
-- Return `202 Accepted` immediately upon successful validation.
+### C. Worker Pool & Redis Repository (`internal/service/pool.go` & `internal/repository/redis.go`)
+- **Worker Pool:** Initialize a buffered channel `IngestChannel = make(chan TelemetryPayload, 10000)`.
+- Spawn a fixed number of goroutines (e.g., `runtime.NumCPU() * 2`) that constantly read from `IngestChannel`.
+- **Redis Writes:** For every payload received from the channel, call `redis.SaveLatestTelemetry`.
+- **Redis Details:** Use `go-redis/v9`. Store data as `HSET device:latest:<DeviceID>`. Utilize Redis Pipelining if the worker batch-reads from the channel, otherwise direct `HSET` is fine since workers run concurrently.
 
-### C. Service Layer & WebSocket Hub (`internal/service/hub.go`)
-- The service layer must act as a central Hub for WebSocket clients.
-- Maintain a thread-safe map of active WebSocket connections (`map[*websocket.Conn]bool`) protected by a `sync.RWMutex`.
-- Provide a `Broadcast(payload TelemetryPayload)` method that iterates through active connections and writes the JSON payload.
-- Implement basic anomaly detection: If `Temperature > 120`, log a high-priority warning (Phase 2 will integrate AI here).
+### D. WebSocket Hub (`internal/service/hub.go`)
+- Use `github.com/gorilla/websocket` (de-facto standard for WS, highly optimized).
+- The Hub must maintain `Clients map[*Client]bool`.
+- Use a `broadcast` channel. The Hub runs in a single goroutine using the strict `select` pattern:
+  ```go
+  select {
+  case client := <-hub.register:
+      hub.clients[client] = true
+  case client := <-hub.unregister:
+      if _, ok := hub.clients[client]; ok {
+          delete(hub.clients, client)
+          close(client.send)
+      }
+  case message := <-hub.broadcast:
+      for client := range hub.clients {
+          // non-blocking send
+          select {
+          case client.send <- message:
+          default:
+              close(client.send)
+              delete(hub.clients, client)
+          }
+      }
+  }
+  ```
+- **Zero-Block Broadcasting:** The `default` case above is critical. If a client's network is slow, its channel buffer fills up. We must drop the client immediately rather than blocking the entire broadcast loop for thousands of other devices.
 
-### D. WebSocket Handler (`internal/api/handlers/ws.go`)
-- Implement `GET /ws/telemetry`.
-- Upgrade the HTTP connection to a WebSocket.
-- Register the connection with the Service Hub.
-- Handle client disconnections gracefully by unregistering them from the Hub and closing the socket.
+## 4. Error Handling & Logging
+- Do not use `panic`. Handle all errors gracefully.
+- Use `log/slog` (introduced in Go 1.21) for highly optimized, zero-allocation structured JSON logging.
 
-## 5. Execution & Testing
-- Ensure the server starts gracefully and listens on port `8080`.
-- Implement graceful shutdown on `SIGINT`/`SIGTERM`, ensuring all Redis and WebSocket connections are closed cleanly.
-- (Reminder: Follow the strict commit strategy defined in `AGENTS.md`).
+## 5. Next Steps for Implementation
+1. Initialize module `github.com/mitra/iiot-telemetry/backend`.
+2. Build the `TelemetryPayload` pool.
+3. Build the HTTP server, routing, and Worker Pool.
+4. Implement Redis connection and asynchronous HSET operations.
+5. Benchmark locally to ensure minimal GC allocation on the hot path.
