@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"time"
 )
 
@@ -38,7 +39,13 @@ func CORSMiddleware(next http.Handler) http.Handler {
 
 // LoggingMiddleware logs request duration and status using structured slog.
 func LoggingMiddleware(next http.Handler) http.Handler {
+	benchMode := os.Getenv("BENCH_MODE") == "1"
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if benchMode {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		start := time.Now()
 		rw := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
 

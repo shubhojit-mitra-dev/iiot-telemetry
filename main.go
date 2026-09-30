@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -19,8 +20,12 @@ import (
 
 func main() {
 	// 1. Initialize High-Performance Structured JSON Logger
+	logLevel := slog.LevelInfo
+	if os.Getenv("BENCH_MODE") == "1" || os.Getenv("LOG_LEVEL") == "WARN" {
+		logLevel = slog.LevelWarn
+	}
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
+		Level: logLevel,
 	}))
 	slog.SetDefault(logger)
 
@@ -72,7 +77,19 @@ func main() {
 
 	// 6. Initialize Worker Pool for Ingestion Pipeline
 	workerCount := runtime.NumCPU() * 2
-	ingestService := service.NewIngestionService(repo, hub, workerCount, 10000)
+	if envWorkers := os.Getenv("WORKER_COUNT"); envWorkers != "" {
+		if w, err := strconv.Atoi(envWorkers); err == nil && w > 0 {
+			workerCount = w
+		}
+	}
+	queueCapacity := 10000
+	if envCap := os.Getenv("QUEUE_CAPACITY"); envCap != "" {
+		if c, err := strconv.Atoi(envCap); err == nil && c > 0 {
+			queueCapacity = c
+		}
+	}
+
+	ingestService := service.NewIngestionService(repo, hub, workerCount, queueCapacity)
 	ingestService.Start(ctx)
 	defer ingestService.Stop()
 
