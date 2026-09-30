@@ -92,7 +92,6 @@ func main() {
 
 	ingestService := service.NewIngestionService(repo, hub, workerCount, queueCapacity)
 	ingestService.Start(ctx)
-	defer ingestService.Stop()
 
 	// 7. Initialize HTTP Server
 	handler := api.NewHandler(ingestService, repo, hub)
@@ -134,6 +133,9 @@ func main() {
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		slog.Error("server forced to shutdown due to timeout", "error", err)
 	}
+
+	// 11. Gracefully drain and stop worker pool AFTER HTTP listener stops accepting requests
+	ingestService.Stop()
 
 	slog.Info("telemetry ingestion platform successfully stopped")
 }

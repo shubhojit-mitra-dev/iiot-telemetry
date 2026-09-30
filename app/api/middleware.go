@@ -78,12 +78,24 @@ func RecoveryMiddleware(next http.Handler) http.Handler {
 
 type responseWriter struct {
 	http.ResponseWriter
-	statusCode int
+	statusCode  int
+	wroteHeader bool
 }
 
 func (rw *responseWriter) WriteHeader(code int) {
+	if rw.wroteHeader {
+		return
+	}
 	rw.statusCode = code
+	rw.wroteHeader = true
 	rw.ResponseWriter.WriteHeader(code)
+}
+
+func (rw *responseWriter) Write(b []byte) (int, error) {
+	if !rw.wroteHeader {
+		rw.WriteHeader(http.StatusOK)
+	}
+	return rw.ResponseWriter.Write(b)
 }
 
 // Hijack implements http.Hijacker to allow protocol upgrades like WebSockets through the middleware chain.
