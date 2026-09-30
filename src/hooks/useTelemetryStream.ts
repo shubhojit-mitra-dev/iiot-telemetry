@@ -125,25 +125,47 @@ export function useTelemetryStream() {
   const lastIncidentTimeRef = useRef<Record<string, number>>({});
   const isUnmountedRef = useRef<boolean>(false);
 
-  // Buffer incoming points onto sliding window charts (capped at 60 points to eliminate leaks)
+  // Dense state tracking to ensure all 10 machines have continuous, fluid chart lines
+  const latestMetricsRef = useRef<{
+    temp: Record<string, number>;
+    vib: Record<string, number>;
+    rpm: Record<string, number>;
+  }>({
+    temp: Object.fromEntries(DEVICES.map(d => [d.id, d.baseTemp])),
+    vib: Object.fromEntries(DEVICES.map(d => [d.id, d.baseVib])),
+    rpm: Object.fromEntries(DEVICES.map(d => [d.id, d.baseRpm])),
+  });
+
+  // Buffer incoming points onto sliding window charts (capped at 60 points to eliminate memory leaks)
   const appendChartPoint = useCallback((payload: TelemetryPayload) => {
     const ts = payload.timestamp > 1e11 ? payload.timestamp : payload.timestamp * 1000;
 
-    const updateSeries = (prev: ChartDataPoint[], val: number): ChartDataPoint[] => {
+    // Update dense metric cache
+    latestMetricsRef.current.temp[payload.device_id] = payload.temperature;
+    latestMetricsRef.current.vib[payload.device_id] = payload.vibration;
+    latestMetricsRef.current.rpm[payload.device_id] = payload.rpm;
+
+    const updateSeries = (
+      prev: ChartDataPoint[],
+      metricKey: 'temp' | 'vib' | 'rpm'
+    ): ChartDataPoint[] => {
       const last = prev[prev.length - 1];
-      // Merge into current time bucket (1000ms window) to group concurrent device streams
-      if (last && Math.abs(last.timestamp - ts) < 1000) {
-        const updated = { ...last, [payload.device_id]: val };
+      const snapshot = latestMetricsRef.current[metricKey];
+
+      // Merge into current time bucket (500ms window) to group asynchronous fleet arrivals
+      if (last && Math.abs(last.timestamp - ts) < 500) {
+        const updated: ChartDataPoint = { ...last, ...snapshot, timestamp: last.timestamp };
         return [...prev.slice(0, -1), updated];
       }
-      // Start a new time bucket
-      const newPoint: ChartDataPoint = { timestamp: ts, [payload.device_id]: val };
+
+      // Start new time bucket seeded with full fleet state vector
+      const newPoint: ChartDataPoint = { timestamp: ts, ...snapshot };
       return [...prev, newPoint].slice(-60);
     };
 
-    setTempSeries(prev => updateSeries(prev, payload.temperature));
-    setVibSeries(prev => updateSeries(prev, payload.vibration));
-    setRpmSeries(prev => updateSeries(prev, payload.rpm));
+    setTempSeries(prev => updateSeries(prev, 'temp'));
+    setVibSeries(prev => updateSeries(prev, 'vib'));
+    setRpmSeries(prev => updateSeries(prev, 'rpm'));
   }, []);
 
   // Update aggregated statistics derived from live device snapshot and backend health
